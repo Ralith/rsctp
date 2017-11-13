@@ -18,7 +18,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 mod chunk;
 mod chunk_queue;
 
-use chunk::{Type, Wire, Param, Chunk, CommonHeader};
+use chunk::{Type, Wire, Param, Chunk, CommonHeader, ParamHeader};
 use chunk_queue::ChunkQueue;
 
 macro_rules! tryopt {
@@ -302,22 +302,18 @@ impl Endpoint {
         match chunk[0] {
             chunk::Init::TYPE => {
                 let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
-                for (ty, value) in params {
-                    match ty {
-                        _ => {} // TODO: Multihoming; MUST generate unrecognized param errors
-                    }
-                }
                 let outbound_streams = cmp::min(init.value.max_inbound_streams, self.outbound_streams);
-                self.out_meta.push((source, init.value.tag));
                 let local_verification_tag = self.rng.gen();
                 let tsn = TransmitSeq(self.rng.gen());
-                self.out.push(chunk::InitAck {
+                self.out_meta.push((source, init.value.tag));
+                let mut reply = self.out.push(chunk::InitAck {
                     tag: local_verification_tag,
                     a_rwnd: self.params.recv_window_initial,
                     outbound_streams,
                     max_inbound_streams: u16::max_value(),
                     tsn,
-                }).param(chunk::Cookie {
+                });
+                reply.param(chunk::Cookie {
                     local_verification_tag,
                     peer_verification_tag: init.value.tag,
                     timestamp: duration_ms(now - self.epoch),
@@ -325,6 +321,19 @@ impl Endpoint {
                     outbound_streams, tsn,
                     recv_tsn: init.value.tsn,
                 });
+                for (ty, value) in params {
+                    match ty {
+                        // TODO: Multihoming
+                        _ => {
+                            if ParamHeader::report(ty) {
+                                reply.unrecognized_param(ty, value);
+                            }
+                            if ParamHeader::stop(ty) {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             chunk::CookieEcho::TYPE => {
                 let (_, mut params) = tryopt!(Chunk::<chunk::CookieEcho>::decode(chunk));
@@ -560,11 +569,11 @@ impl Peer {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum ErrorKind {
     /// Peer violated the protocol
     Protocol,
-    /// Peer does not appear to be responding
+    /// Peer is not responding
     Timeout,
 }
 

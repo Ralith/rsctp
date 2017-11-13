@@ -95,6 +95,22 @@ impl<'a, T> ParamsBuilder<'a, T> {
         self.chunk_length += total_param_size;
         self
     }
+
+    pub fn unrecognized_param(&mut self, ty: u16, value: &[u8]) -> &mut Self {
+        let total_param_size = value.len() as u16 + 8;
+        self.queue.ensure_free(total_param_size as usize);
+        {
+            let start = self.queue.cursor + self.chunk_length as usize;
+            let mem = &mut self.queue.storage[start..start + (total_param_size as usize)];
+            NetworkEndian::write_u16(&mut mem[0..2], 8);
+            NetworkEndian::write_u16(&mut mem[2..4], total_param_size);
+            NetworkEndian::write_u16(&mut mem[4..6], ty);
+            NetworkEndian::write_u16(&mut mem[6..8], value.len() as u16 + 4);
+            mem[8..].copy_from_slice(value);
+        }
+        self.chunk_length += total_param_size;
+        self
+    }
 }
 
 impl<'a, F> Drop for ParamsBuilder<'a, F> {

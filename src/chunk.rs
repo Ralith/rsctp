@@ -1,4 +1,5 @@
 use std::mem;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use byteorder::{ByteOrder, NetworkEndian};
 
@@ -90,6 +91,14 @@ wire!{
     length: u16,
 }
 
+impl ParamHeader {
+    /// If set for an unrecognized parameter, do not process any further parameters
+    pub fn stop(ty: u16) -> bool { ty & (1 << 15) != 0 }
+    /// If set for an unrecognized parameter, report the error in an "Unrecognized Parameter" parameter to an
+    /// appropriate chunk
+    pub fn report(ty: u16) -> bool { ty & (1 << 14) != 0 }
+}
+
 macro_rules! param {
     {$name:ident = $param_ty:expr, $($field:ident : $ty:ty,)*} => {
         wire!{$name, $($field : $ty,)*}
@@ -115,6 +124,16 @@ param!{
 param!{
     StaleCookieError = 3,
     measure: u32,
+}
+
+param!{
+    Ipv4Address = 5,
+    address: Ipv4Addr,
+}
+
+param!{
+    Ipv6Address = 6,
+    address: Ipv6Addr,
 }
 
 trait Field: Copy {
@@ -150,6 +169,19 @@ impl Field for TransmitSeq {
 impl Field for StreamSeq {
     fn decode(data: &[u8]) -> Self { StreamSeq(NetworkEndian::read_u16(data)) }
     fn encode(self, dest: &mut [u8]) { NetworkEndian::write_u16(dest, self.0) }
+}
+
+impl Field for Ipv4Addr {
+    fn decode(data: &[u8]) -> Self { Ipv4Addr::new(data[0], data[1], data[2], data[3]) }
+    fn encode(self, dest: &mut [u8]) { dest.copy_from_slice(&self.octets()) }
+}
+
+impl Field for Ipv6Addr {
+    fn decode(data: &[u8]) -> Self {
+        if data.len() != 16 { panic!("incorrect length for an ipv6 address"); }
+        unsafe { Self::from(*(data.as_ptr() as *const [u8; 16])) }
+    }
+    fn encode(self, dest: &mut [u8]) { dest.copy_from_slice(&self.octets()) }
 }
 
 pub struct Chunk<T: Type> {
