@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use byteorder::{ByteOrder, NetworkEndian};
 
-use chunk::{self, Type, Wire, Param, Chunk, ParamHeader};
+use chunk::{self, Param, Chunk};
 
 pub struct ChunkQueue {
     storage: Box<[u8]>,

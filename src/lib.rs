@@ -6,7 +6,6 @@ extern crate bitflags;
 extern crate crc32c_hw;
 
 use std::{fmt, ops, io, cmp};
-use std::ops::Range;
 use std::cmp::Ordering;
 use std::net::{SocketAddr, IpAddr};
 use std::time::{Duration, Instant};
@@ -183,10 +182,12 @@ impl Endpoint {
             last_recv_tsn: TransmitSeq(0),
             ack_state: 0,
             cumul_tsn_ack: tsn - 1,
+            remote_cookie: None,
+            init_retransmits: 0,
         });
         self.associations[id].out_streams.resize(streams as usize, StreamSeq(0));
         let mut peer = Peer::new(now, id, RoundTripTimer::new(self.params.rto_initial));
-        peer.out.push(chunk::Init {
+        peer.send(now, chunk::Init {
             tag: local_verification_tag,
             a_rwnd: self.params.recv_window_initial,
             outbound_streams: streams,
@@ -247,50 +248,52 @@ impl Endpoint {
         match (self.associations[assoc_id].state, chunk[0]) {
             (State::CookieWait, chunk::InitAck::TYPE) => {
                 let (ack, params) = tryopt!(Chunk::<chunk::InitAck>::decode(chunk));
-                let mut got_cookie = false;
                 {
-                    let mut reply = self.peers.get_mut(&source).unwrap().out.push(chunk::CookieEcho {});
+                    let mut reply = self.peers.get_mut(&source).unwrap().send(now, chunk::CookieEcho {});
                     for (ty, value) in params {
                         match ty {
                             chunk::Cookie::TYPE => {
                                 reply.raw_param(ty, value);
-                                got_cookie = true;
+                                self.associations[assoc_id].remote_cookie = Some(value.to_vec().into_boxed_slice());
                             }
-                            _ => {} // TODO: SHOULD denerate unrecognized param errors
+                            _ => {} // TODO: SHOULD generate unrecognized param errors
                         }
                     }
                 }
 
-                if !got_cookie {
+                if self.associations[assoc_id].remote_cookie.is_none() {
                     // Cookie is required
                     self.out_meta.push((source, ack.value.tag));
                     self.out.push(chunk::Abort {});
-                    self.associations.remove(assoc_id);
-                    self.peers.remove(&source);
-                    self.events.push_back((assoc_id, Event::CommunicationLost { reason: Some(ErrorKind::Protocol) }));
+                    self.remove_assoc(assoc_id, Some(ErrorKind::Protocol));
                     return;
                 }
 
                 let tcb = &mut self.associations[assoc_id];
                 tcb.peer_verification_tag = ack.value.tag;
                 tcb.state = State::CookieEchoed;
+                tcb.init_retransmits = 0;
                 tcb.last_recv_tsn = ack.value.tsn; // - 1?
                 tcb.in_streams.resize(ack.value.outbound_streams as usize, StreamSeq(0));
                 tcb.out_streams.truncate(ack.value.max_inbound_streams as usize);
                 tcb.out_streams.shrink_to_fit();
                 // TODO: Set and use initial RTT
-                self.events.push_back((assoc_id, Event::TimerStart(TimerKind::Global(1), Duration::from_millis(self.params.rto_initial as u64))));
+                let peer = self.peers.get_mut(&source).unwrap();
+                peer.rto.init(duration_ms(now - peer.last_time) as u32);
+                self.events.push_back((assoc_id, Event::TimerStart(TimerKind::Global(1), peer.rto.get())));
             }
             (State::CookieEchoed, chunk::CookieAck::TYPE) => {
                 tryopt!(Chunk::<chunk::CookieAck>::decode(chunk));
                 let tcb = &mut self.associations[assoc_id];
                 tcb.state = State::Established;
+                tcb.remote_cookie = None; // We don't need this any more
                 self.events.push_back((assoc_id, Event::TimerStop(TimerKind::Global(1))));
                 self.events.push_back((assoc_id, Event::CommunicationUp {
                     outbound_streams: tcb.out_streams.len() as u16,
                     inbound_streams: tcb.in_streams.len() as u16,
                 }));
             }
+            (_, chunk::CookieAck::TYPE) => {} // §5.2.5
             _ => unimplemented!()
         }
     }
@@ -333,7 +336,7 @@ impl Endpoint {
                     // Stale cookie
                     let measure = 1000 * (duration_ms(rtt) as u32 - self.params.valid_cookie_life);
                     self.out_meta.push((source, cookie.peer_verification_tag));
-                    self.out.push(chunk::Abort {})
+                    self.out.push(chunk::Error {})
                         .param(chunk::StaleCookieError { measure });
                     return;
                 } 
@@ -348,13 +351,15 @@ impl Endpoint {
                     last_recv_tsn: cookie.recv_tsn, // - 1?
                     ack_state: 0,
                     cumul_tsn_ack: cookie.tsn - 1,
+                    remote_cookie: None,
+                    init_retransmits: 0,
                 });
                 self.associations[id].out_streams.resize(cookie.outbound_streams as usize, StreamSeq(0));
                 self.associations[id].in_streams.resize(cookie.inbound_streams as usize, StreamSeq(0));
                 let mut rttimer = RoundTripTimer::new(self.params.rto_initial);
                 rttimer.init(duration_ms(rtt) as u32);
                 let mut peer = Peer::new(now, id, rttimer);
-                peer.out.push(chunk::CookieAck {});
+                peer.send(now, chunk::CookieAck {});
                 self.peers.insert(source, peer);
                 self.events.push_back((id, Event::CommunicationUp {
                     outbound_streams: cookie.outbound_streams,
@@ -367,25 +372,53 @@ impl Endpoint {
         }
     }
 
-    pub fn handle_timeout(&mut self, assoc: usize, kind: TimerKind) {
-        let tcb = &mut self.associations[assoc];
-        match (tcb.state, kind) {
+    /// Must only be called after processing timer start/stop events
+    pub fn handle_timeout(&mut self, now: Instant, assoc: usize, kind: TimerKind) {
+        match (self.associations[assoc].state, kind) {
             (State::CookieWait, TimerKind::Global(1)) => {
-                let timer = &mut self.peers.get_mut(&tcb.primary_path).unwrap().rtt;
-                timer.expire(self.params.rto_max);
-                self.events.push_back((assoc,  Event::TimerStart(TimerKind::Global(1), timer.rto())));
-                // Retransmit Init
-                unimplemented!()
+                if self.associations[assoc].init_retransmits >= self.params.max_init_retrans {
+                    self.remove_assoc(assoc, Some(ErrorKind::Timeout));
+                    return;
+                }
+
+                let tcb = &mut self.associations[assoc];
+                let peer = self.peers.get_mut(&tcb.primary_path).unwrap();
+                peer.rto.expire(self.params.rto_max);
+                self.events.push_back((assoc, Event::TimerStart(TimerKind::Global(1), peer.rto.get())));
+                // Retransmit
+                tcb.init_retransmits += 1;
+                peer.send(now, chunk::Init {
+                    tag: tcb.local_verification_tag,
+                    a_rwnd: self.params.recv_window_initial,
+                    outbound_streams: tcb.out_streams.len() as u16,
+                    max_inbound_streams: u16::max_value(),
+                    tsn: tcb.next_tsn - 1,
+                });
             }
             (State::CookieEchoed, TimerKind::Global(1)) => {
-                let timer = &mut self.peers.get_mut(&tcb.primary_path).unwrap().rtt;
-                timer.expire(self.params.rto_max);
-                self.events.push_back((assoc, Event::TimerStart(TimerKind::Global(1), timer.rto())));
-                // Retransmit CookieEcho
-                unimplemented!()
+                if self.associations[assoc].init_retransmits >= self.params.max_init_retrans {
+                    self.remove_assoc(assoc, Some(ErrorKind::Timeout));
+                    return;
+                }
+
+                let tcb = &mut self.associations[assoc];
+                let peer = self.peers.get_mut(&tcb.primary_path).unwrap();
+                peer.rto.expire(self.params.rto_max);
+                self.events.push_back((assoc, Event::TimerStart(TimerKind::Global(1), peer.rto.get())));
+                // Retransmit
+                tcb.init_retransmits += 1;
+                peer.send(now, chunk::CookieEcho {})
+                    .raw_param(chunk::Cookie::TYPE, tcb.remote_cookie.as_ref().unwrap());
             }
-            _ => unimplemented!()
+            _ => unreachable!()
         }
+    }
+
+    fn remove_assoc(&mut self, assoc: usize, reason: Option<ErrorKind>) {
+        // TODO: Multihoming
+        self.peers.remove(&self.associations[assoc].primary_path);
+        self.associations.remove(assoc);
+        self.events.push_back((assoc, Event::CommunicationLost { reason }));
     }
 }
 
@@ -407,6 +440,11 @@ struct Association {
     last_recv_tsn: TransmitSeq,
     ack_state: u8,
     cumul_tsn_ack: TransmitSeq,
+
+    /// Used only in state CookieEchoed to support retransmits
+    remote_cookie: Option<Box<[u8]>>,
+    /// Used only in state CookieWait and CookieEchoed to enable timing out
+    init_retransmits: u32,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -446,7 +484,7 @@ impl RoundTripTimer {
         self.rto = cmp::min(rto_max, self.rto * 2);
     }
 
-    pub fn rto(&self) -> Duration {
+    pub fn get(&self) -> Duration {
         Duration::from_millis(self.rto as u64)
     }
 }
@@ -500,21 +538,26 @@ pub struct Status {
 pub struct Peer {
     association: usize,
     reachable: bool,
-    rtt: RoundTripTimer,
+    rto: RoundTripTimer,
     rto_pending: bool,
     last_time: Instant,
     out: ChunkQueue,
 }
 
 impl Peer {
-    fn new(now: Instant, association: usize, rtt: RoundTripTimer) -> Self {
+    fn new(now: Instant, association: usize, rto: RoundTripTimer) -> Self {
         Peer {
-            association, rtt,
+            association, rto,
             reachable: true,
             rto_pending: false,
             last_time: now,
             out: ChunkQueue::new(),
         }
+    }
+
+    fn send<T: chunk::Type>(&mut self, now: Instant, x: T) -> chunk_queue::ParamsBuilder<T> {
+        self.last_time = now;
+        self.out.push(x)
     }
 }
 
@@ -522,15 +565,17 @@ impl Peer {
 pub enum ErrorKind {
     /// Peer violated the protocol
     Protocol,
+    /// Peer does not appear to be responding
+    Timeout,
 }
 
 #[derive(Debug)]
 pub enum Event {
     DataArrive { stream: u16 },
-    SendFailure { reason: io::Error, context: u32 },
+    SendFailure { reason: ErrorKind, context: u32 },
     CommunicationUp { outbound_streams: u16, inbound_streams: u16 },
     CommunicationLost { reason: Option<ErrorKind> },
-    CommunicationError { reason: io::Error },
+    CommunicationError { reason: ErrorKind },
     Restart,
     ShutdownComplete,
 
@@ -613,6 +658,33 @@ mod tests {
         assert_eq!(client.associations[client_assoc].state, State::Established);
         let server_assoc = server.peers.get(&client_addr).expect("server missing client peer").association;
         assert_eq!(server.associations[server_assoc].state, State::Established);
+    }
+
+    #[test]
+    fn init_timeout() {
+        let proto_params = Parameters::default();
+        let mut now = Instant::now();
+
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 24);
+
+        let mut client = Endpoint::new(proto_params, now, client_addr.port(), 1).unwrap();
+
+        let client_assoc = client.associate(now, server_addr, 1);
+        assert_eq!(client.associations[client_assoc].state, State::CookieWait);
+        let mut timed_out = false;
+        while let Some((assoc, event)) = client.poll() {
+            use Event::*;
+            match event {
+                TimerStart(kind, duration) => {
+                    now += duration;
+                    client.handle_timeout(now, assoc, kind);
+                }
+                CommunicationLost { reason: Some(ErrorKind::Timeout) } => { timed_out = true; }
+                e => panic!("unexpected event: {:?}", e),
+            }
+        }
+        assert!(timed_out);
     }
 
     fn transmit(now: Instant, send: &mut Endpoint, send_addr: SocketAddr, recv: &mut Endpoint, recv_addr: SocketAddr) {
