@@ -277,7 +277,6 @@ impl Endpoint {
                 tcb.in_streams.resize(ack.value.outbound_streams as usize, StreamSeq(0));
                 tcb.out_streams.truncate(ack.value.max_inbound_streams as usize);
                 tcb.out_streams.shrink_to_fit();
-                // TODO: Set and use initial RTT
                 let peer = self.peers.get_mut(&source).unwrap();
                 peer.rto.init(duration_ms(now - peer.last_time) as u32);
                 self.events.push_back((assoc_id, Event::TimerStart(TimerKind::Global(1), peer.rto.get())));
@@ -286,7 +285,7 @@ impl Endpoint {
                 tryopt!(Chunk::<chunk::CookieAck>::decode(chunk));
                 let tcb = &mut self.associations[assoc_id];
                 tcb.state = State::Established;
-                tcb.remote_cookie = None; // We don't need this any more
+                tcb.remote_cookie = None; // We don't need the data stored here once established
                 self.events.push_back((assoc_id, Event::TimerStop(TimerKind::Global(1))));
                 self.events.push_back((assoc_id, Event::CommunicationUp {
                     outbound_streams: tcb.out_streams.len() as u16,
@@ -569,7 +568,7 @@ pub enum ErrorKind {
     Timeout,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Event {
     DataArrive { stream: u16 },
     SendFailure { reason: ErrorKind, context: u32 },
@@ -671,7 +670,6 @@ mod tests {
         let mut client = Endpoint::new(proto_params, now, client_addr.port(), 1).unwrap();
 
         let client_assoc = client.associate(now, server_addr, 1);
-        assert_eq!(client.associations[client_assoc].state, State::CookieWait);
         let mut timed_out = false;
         while let Some((assoc, event)) = client.poll() {
             use Event::*;
@@ -682,6 +680,44 @@ mod tests {
                 }
                 CommunicationLost { reason: Some(ErrorKind::Timeout) } => { timed_out = true; }
                 e => panic!("unexpected event: {:?}", e),
+            }
+        }
+        assert!(timed_out);
+    }
+
+    #[test]
+    fn cookie_echo_timeout() {
+        let proto_params = Parameters::default();
+        let mut now = Instant::now();
+
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 24);
+
+        let mut client = Endpoint::new(proto_params, now, client_addr.port(), 1).unwrap();
+        let mut server = Endpoint::new(proto_params, now, server_addr.port(), 1).unwrap();
+
+        let client_assoc = client.associate(now, server_addr, 1);
+        // Drain events so we don't feed the CookeEchoed state timeouts for CookieWait's timer
+        while let Some((_, event)) = client.poll() {
+            use Event::*;
+            match event {
+                TimerStart(_, _) => {}
+                _ => panic!("unexpected event: {:?}", event),
+            }
+        }
+        transmit(now, &mut client, client_addr, &mut server, server_addr);
+        transmit(now, &mut server, server_addr, &mut client, client_addr);
+        assert_eq!(client.associations[client_assoc].state, State::CookieEchoed);
+        let mut timed_out = false;
+        while let Some((assoc, event)) = client.poll() {
+            use Event::*;
+            match event {
+                TimerStart(kind, duration) => {
+                    now += duration;
+                    client.handle_timeout(now, assoc, kind);
+                }
+                CommunicationLost { reason: Some(ErrorKind::Timeout) } => { timed_out = true; }
+                _ => panic!("unexpected event: {:?}", event),
             }
         }
         assert!(timed_out);
