@@ -244,8 +244,7 @@ impl Endpoint {
 
     /// Process a chunk from a peer in an existing association
     fn handle_assoc_chunk(&mut self, now: Instant, source: SocketAddr, assoc_id: usize, chunk: &[u8]) {
-        let tcb = &mut self.associations[assoc_id];
-        match (tcb.state, chunk[0]) {
+        match (self.associations[assoc_id].state, chunk[0]) {
             (State::CookieWait, chunk::InitAck::TYPE) => {
                 let (ack, params) = tryopt!(Chunk::<chunk::InitAck>::decode(chunk));
                 let mut reply = self.peers.get_mut(&source).unwrap().out.push(chunk::CookieEcho {});
@@ -264,9 +263,10 @@ impl Endpoint {
                     // Cookie is required
                     self.out_meta.push((source, ack.value.tag));
                     self.out.push(chunk::Abort {});
+                    self.associations.remove(assoc_id);
                     return;
                 }
-
+                let tcb = &mut self.associations[assoc_id];
                 tcb.peer_verification_tag = ack.value.tag;
                 tcb.state = State::CookieEchoed;
                 tcb.last_recv_tsn = ack.value.tsn; // - 1?
@@ -278,6 +278,7 @@ impl Endpoint {
             }
             (State::CookieEchoed, chunk::CookieAck::TYPE) => {
                 tryopt!(Chunk::<chunk::CookieAck>::decode(chunk));
+                let tcb = &mut self.associations[assoc_id];
                 tcb.state = State::Established;
                 self.events.push_back((assoc_id, Event::TimerStop(TimerKind::Global(1))));
                 self.events.push_back((assoc_id, Event::CommunicationUp {
@@ -326,7 +327,9 @@ impl Endpoint {
                 if rtt > Duration::from_millis(self.params.valid_cookie_life as u64) {
                     // Stale cookie
                     let measure = 1000 * (duration_ms(rtt) as u32 - self.params.valid_cookie_life);
-                    self.send_abort(source, cookie.peer_verification_tag, chunk::StaleCookieError { measure });
+                    self.out_meta.push((source, cookie.peer_verification_tag));
+                    self.out.push(chunk::Abort {})
+                        .param(chunk::StaleCookieError { measure });
                     return;
                 } 
                 let id = self.associations.insert(Association {
@@ -357,12 +360,6 @@ impl Endpoint {
             chunk::Abort::TYPE => {}
             _ => unimplemented!()
         }
-    }
-
-    fn send_abort<T: chunk::Param>(&mut self, dest: SocketAddr, tag: u32, reason: T) {
-        self.out_meta.push((dest, tag));
-        self.out.push(chunk::Abort {})
-            .param(reason);
     }
 
     pub fn handle_timeout(&mut self, assoc: usize, kind: TimerKind) {
