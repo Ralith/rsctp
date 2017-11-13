@@ -5,8 +5,8 @@ use byteorder::{ByteOrder, NetworkEndian};
 
 use {TransmitSeq, StreamSeq};
 
-pub trait Wire {
-    fn decode(data: &[u8]) -> Self;
+pub trait Wire<'a> {
+    fn decode(data: &'a [u8]) -> Self;
     fn encode(&self, dest: &mut [u8]);
     fn size() -> u16;         // TODO: associated const once size_of is const fn
 }
@@ -25,10 +25,10 @@ macro_rules! wire_nonempty {
         pub struct $name {
             $(pub $field: $ty),*
         }
-        impl Wire for $name {
+        impl<'a> Wire<'a> for $name {
             fn size() -> u16 { sum!($(::std::mem::size_of::<$ty>()),*) as u16 }
             #[allow(unused_assignments)]
-            fn decode(data: &[u8]) -> Self {
+            fn decode(data: &'a [u8]) -> Self {
                 let mut i = 0;
                 Self {
                     $($field: { let x = <$ty as Field>::decode(&data[i..]); i += mem::size_of::<$ty>(); x }),*
@@ -50,7 +50,7 @@ macro_rules! wire {
     {$name:ident,} => {
         #[derive(Debug, Copy, Clone)]
         pub struct $name {}
-        impl Wire for $name {
+        impl<'a> Wire<'a> for $name {
             fn size() -> u16 { 0 }
             fn decode(data: &[u8]) -> Self { $name {} }
             fn encode(&self, dest: &mut [u8]) {}
@@ -75,14 +75,42 @@ impl CommonHeader {
     }
 }
 
-pub trait Type: Wire {
+pub trait Type: for<'a> Wire<'a> {
     type Flags: From<u8> + Into<u8> + Copy;
     const TYPE: u8;
 }
 
-pub trait Param: Wire {
+pub trait Param<'a>: Wire<'a> {
     const TYPE: u16;
     fn dynamic_size(&self) -> u16;
+}
+
+pub struct UnrecognizedParameter<'a> {
+    pub ty: u16,
+    pub value: &'a [u8],
+}
+
+impl<'a> Wire<'a> for UnrecognizedParameter<'a> {
+    fn size() -> u16 { 4 }
+    fn decode(data: &'a [u8]) -> Self {
+        let header = ParamHeader::decode(&data[0..4]);
+        UnrecognizedParameter {
+            ty: header.ty,
+            value: &data[4..header.length as usize],
+        }
+    }
+    fn encode(&self, dest: &mut [u8]) {
+        ParamHeader {
+            ty: self.ty,
+            length: self.value.len() as u16,
+        }.encode(&mut dest[0..4]);
+        dest[4..].copy_from_slice(self.value);
+    }
+}
+
+impl<'a> Param<'a> for UnrecognizedParameter<'a> {
+    const TYPE: u16 = 8;
+    fn dynamic_size(&self) -> u16 { self.value.len() as u16 + 4 }
 }
 
 wire!{
@@ -102,7 +130,7 @@ impl ParamHeader {
 macro_rules! param {
     {$name:ident = $param_ty:expr, $($field:ident : $ty:ty,)*} => {
         wire!{$name, $($field : $ty,)*}
-        impl Param for $name {
+        impl<'a> Param<'a> for $name {
             const TYPE: u16 = $param_ty;
             fn dynamic_size(&self) -> u16 { <Self as Wire>::size() }
         }

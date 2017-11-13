@@ -326,7 +326,7 @@ impl Endpoint {
                         // TODO: Multihoming
                         _ => {
                             if ParamHeader::report(ty) {
-                                reply.unrecognized_param(ty, value);
+                                reply.param(chunk::UnrecognizedParameter { ty, value });
                             }
                             if ParamHeader::stop(ty) {
                                 break;
