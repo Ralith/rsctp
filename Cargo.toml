@@ -1,0 +1,11 @@
+[package]
+name = "rsctp"
+version = "0.1.0"
+authors = ["Benjamin Saunders <ben.e.saunders@gmail.com>"]
+
+[dependencies]
+rand = "0.3"
+byteorder = "1.1"
+slab = "0.4"
+bitflags = "1"
+crc32c-hw = "0.1.2"
