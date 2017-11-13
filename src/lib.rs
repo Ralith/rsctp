@@ -247,15 +247,17 @@ impl Endpoint {
         match (self.associations[assoc_id].state, chunk[0]) {
             (State::CookieWait, chunk::InitAck::TYPE) => {
                 let (ack, params) = tryopt!(Chunk::<chunk::InitAck>::decode(chunk));
-                let mut reply = self.peers.get_mut(&source).unwrap().out.push(chunk::CookieEcho {});
                 let mut got_cookie = false;
-                for (ty, value) in params {
-                    match ty {
-                        chunk::Cookie::TYPE => {
-                            reply.raw_param(ty, value);
-                            got_cookie = true;
+                {
+                    let mut reply = self.peers.get_mut(&source).unwrap().out.push(chunk::CookieEcho {});
+                    for (ty, value) in params {
+                        match ty {
+                            chunk::Cookie::TYPE => {
+                                reply.raw_param(ty, value);
+                                got_cookie = true;
+                            }
+                            _ => {} // TODO: SHOULD denerate unrecognized param errors
                         }
-                        _ => {} // TODO: SHOULD denerate unrecognized param errors
                     }
                 }
 
@@ -264,8 +266,11 @@ impl Endpoint {
                     self.out_meta.push((source, ack.value.tag));
                     self.out.push(chunk::Abort {});
                     self.associations.remove(assoc_id);
+                    self.peers.remove(&source);
+                    self.events.push_back((assoc_id, Event::CommunicationLost { reason: Some(ErrorKind::Protocol) }));
                     return;
                 }
+
                 let tcb = &mut self.associations[assoc_id];
                 tcb.peer_verification_tag = ack.value.tag;
                 tcb.state = State::CookieEchoed;
@@ -274,7 +279,7 @@ impl Endpoint {
                 tcb.out_streams.truncate(ack.value.max_inbound_streams as usize);
                 tcb.out_streams.shrink_to_fit();
                 // TODO: Set and use initial RTT
-                self.events.push_back((assoc_id,  Event::TimerStart(TimerKind::Global(1), Duration::from_millis(self.params.rto_initial as u64))));
+                self.events.push_back((assoc_id, Event::TimerStart(TimerKind::Global(1), Duration::from_millis(self.params.rto_initial as u64))));
             }
             (State::CookieEchoed, chunk::CookieAck::TYPE) => {
                 tryopt!(Chunk::<chunk::CookieAck>::decode(chunk));
@@ -513,12 +518,18 @@ impl Peer {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ErrorKind {
+    /// Peer violated the protocol
+    Protocol,
+}
+
 #[derive(Debug)]
 pub enum Event {
     DataArrive { stream: u16 },
     SendFailure { reason: io::Error, context: u32 },
     CommunicationUp { outbound_streams: u16, inbound_streams: u16 },
-    CommunicationLost { reason: Option<io::Error>, last_acked: TransmitSeq, last_sent: TransmitSeq },
+    CommunicationLost { reason: Option<ErrorKind> },
     CommunicationError { reason: io::Error },
     Restart,
     ShutdownComplete,
