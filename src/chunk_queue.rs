@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use byteorder::{ByteOrder, NetworkEndian};
 
-use chunk::{self, Param, Chunk};
+use chunk::{self, Chunk};
 
 pub struct ChunkQueue {
     storage: Box<[u8]>,
@@ -34,7 +34,7 @@ impl ChunkQueue {
 
     pub fn clear(&mut self) { self.cursor = 0 }
 
-    pub fn iter(&self) -> Iter { Iter(&self.storage[..self.cursor]) }
+    pub fn iter(&self) -> Iter { Iter::new(&self.storage[..self.cursor]) }
     pub fn is_empty(&self) -> bool { self.cursor == 0 }
 
     fn free(&self) -> usize {
@@ -97,6 +97,19 @@ impl<'a, T> ParamsBuilder<'a, T> {
     }
 }
 
+impl<'a, T> ::std::ops::Deref for ParamsBuilder<'a, T> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.queue.storage[self.queue.cursor..self.queue.cursor+self.chunk_length as usize]
+    }
+}
+
+impl<'a, T> ::std::ops::DerefMut for ParamsBuilder<'a, T> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.queue.storage[self.queue.cursor..self.queue.cursor+self.chunk_length as usize]
+    }
+}
+
 impl<'a, F> Drop for ParamsBuilder<'a, F> {
     fn drop(&mut self) {
         let length_field = self.queue.cursor + 2;
@@ -106,6 +119,10 @@ impl<'a, F> Drop for ParamsBuilder<'a, F> {
 }
 
 pub struct Iter<'a>(&'a [u8]);
+
+impl<'a> Iter<'a> {
+    pub fn new(chunks: &'a [u8]) -> Self { Iter(chunks) }
+}
 
 impl<'a> Iterator for Iter<'a> {
     type Item = &'a [u8];

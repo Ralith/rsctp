@@ -1,9 +1,11 @@
-use std::mem;
+use std::{mem};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use byteorder::{ByteOrder, NetworkEndian};
+use generic_array::GenericArray;
+use crypto_mac::{Mac, MacResult};
 
-use {TransmitSeq, StreamSeq};
+use {TransmitSeq, StreamSeq, MacAlgo, MacCode};
 
 pub trait Wire<'a> {
     fn decode(data: &'a [u8]) -> Self;
@@ -31,14 +33,14 @@ macro_rules! wire_nonempty {
             fn decode(data: &'a [u8]) -> Self {
                 let mut i = 0;
                 Self {
-                    $($field: { let x = <$ty as Field>::decode(&data[i..]); i += mem::size_of::<$ty>(); x }),*
+                    $($field: { let x = <$ty as Field>::decode(&data[i..i+mem::size_of::<$ty>()]); i += mem::size_of::<$ty>(); x }),*
                 }
             }
             #[allow(unused_assignments)]
             fn encode(&self, dest: &mut [u8]) {
                 let mut i = 0;
                 $(
-                    <$ty as Field>::encode(self.$field, &mut dest[i..]);
+                    <$ty as Field>::encode(self.$field, &mut dest[i..i+mem::size_of::<$ty>()]);
                     i += mem::size_of::<$ty>();
                 )*
             }
@@ -52,8 +54,8 @@ macro_rules! wire {
         pub struct $name {}
         impl<'a> Wire<'a> for $name {
             fn size() -> u16 { 0 }
-            fn decode(data: &[u8]) -> Self { $name {} }
-            fn encode(&self, dest: &mut [u8]) {}
+            fn decode(_data: &[u8]) -> Self { $name {} }
+            fn encode(&self, _dest: &mut [u8]) {}
         }
     };
     {$name:ident, $field0:ident : $ty0:ty, $($field:ident : $ty:ty,)*} => {
@@ -140,6 +142,7 @@ macro_rules! param {
 // TODO: MAC
 param!{
     Cookie = 7,
+    mac: MacCode,
     inbound_streams: u16,
     outbound_streams: u16,
     peer_verification_tag: u32,
@@ -148,6 +151,23 @@ param!{
     tsn: TransmitSeq,
     recv_tsn: TransmitSeq,
 }
+
+impl Cookie {
+    pub fn write_mac(key: &[u8], dest: &mut [u8]) {
+        let mut algo = MacAlgo::new(key);
+        let field_end = mem::size_of::<MacCode>();
+        algo.input(&dest[field_end..]);
+        dest[..field_end].copy_from_slice(algo.result().code());
+    }
+
+    pub fn check_mac(key: &[u8], data: &[u8]) -> bool {
+        let mut algo = MacAlgo::new(key);
+        let field_end = mem::size_of::<MacCode>();
+        algo.input(&data[field_end..]);
+        algo.result() == MacResult::from_slice(&data[..field_end])
+    }
+}
+
 
 param!{
     StaleCookieError = 3,
@@ -212,6 +232,15 @@ impl Field for Ipv6Addr {
     fn encode(self, dest: &mut [u8]) { dest.copy_from_slice(&self.octets()) }
 }
 
+impl Field for MacCode {
+    fn decode(data: &[u8]) -> Self {
+        *GenericArray::from_slice(data)
+    }
+    fn encode(self, dest: &mut [u8]) {
+        dest.copy_from_slice(&self);
+    }
+}
+
 pub struct Chunk<T: Type> {
     pub flags: T::Flags,
     pub length: u16,
@@ -271,11 +300,8 @@ macro_rules! chunk {
         chunk_inner!{$name = $chunk_ty, $flags, $($field : $ty,)*}
         #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
         pub struct $flags {}
-        impl From<u8> for $flags { fn from(x: u8) -> $flags { $flags {} } }
+        impl From<u8> for $flags { fn from(_: u8) -> $flags { $flags {} } }
         impl Into<u8> for $flags { fn into(self) -> u8 { 0 } }
-        impl $flags {
-            pub fn empty() -> Self { $flags {} }
-        }
     };
 }
 

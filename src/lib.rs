@@ -4,6 +4,9 @@ extern crate slab;
 #[macro_use]
 extern crate bitflags;
 extern crate crc32c_hw;
+extern crate blake2;
+extern crate crypto_mac;
+extern crate generic_array;
 
 use std::{fmt, ops, io, cmp};
 use std::cmp::Ordering;
@@ -13,7 +16,9 @@ use std::collections::{HashMap, VecDeque};
 
 use slab::Slab;
 use rand::{OsRng, Rng};
-use byteorder::{ByteOrder, NetworkEndian};
+use blake2::Blake2b;
+use crypto_mac::Mac;
+use generic_array::GenericArray;
 
 mod chunk;
 mod chunk_queue;
@@ -141,6 +146,9 @@ impl Default for Parameters {
     }
 }
 
+type MacAlgo = Blake2b;
+type MacCode = GenericArray<u8, <MacAlgo as Mac>::OutputSize>;
+
 pub struct Endpoint {
     params: Parameters,
     port: u16,
@@ -151,17 +159,22 @@ pub struct Endpoint {
     rng: OsRng,
     events: VecDeque<(usize, Event)>,
     epoch: Instant,
+    /// List of chunks to be transmitted outside of an association; addresses and tags stored 1:1 in `out_meta`
     out: ChunkQueue,
     out_meta: Vec<(SocketAddr, u32)>,
+    // TODO: Refresh this occasionally (every n uses?)
+    mac_key: GenericArray<u8, <MacAlgo as Mac>::OutputSize>,
 }
 
 impl Endpoint {
     pub fn new(params: Parameters, epoch: Instant, port: u16, outbound_streams: u16) -> io::Result<Self> {
+        let mut rng = OsRng::new()?;
+        let mut mac_key = *GenericArray::from_slice(&[0; 64]);
+        rng.fill_bytes(&mut mac_key);
         Ok(Endpoint {
-            params, port, outbound_streams, epoch,
+            params, port, outbound_streams, epoch, rng, mac_key,
             associations: Slab::new(),
             peers: HashMap::new(),
-            rng: OsRng::new()?,
             events: VecDeque::new(),
             out: ChunkQueue::new(),
             out_meta: Vec::new(),
@@ -199,15 +212,19 @@ impl Endpoint {
         id
     }
 
-    pub fn shutdown(&self, assoc: usize) { unimplemented!() }
+    pub fn shutdown(&mut self, _assoc: usize) { unimplemented!() }
 
-    pub fn abort(&self, assoc: usize) { unimplemented!() }
+    pub fn abort(&mut self, assoc: usize) {
+        self.out_meta.push((self.associations[assoc].primary_path, self.associations[assoc].peer_verification_tag));
+        self.out.push(chunk::Abort {});
+        self.remove_assoc(assoc, None);
+    }
 
-    pub fn send(&self, assoc: usize, params: Send) { unimplemented!() }
+    pub fn send(&mut self, _assoc: usize, _params: Send) { unimplemented!() }
 
-    pub fn receive(&self, assoc: usize) -> &[Receive] { unimplemented!() }
+    pub fn receive(&mut self, _assoc: usize) -> &[Receive] { unimplemented!() }
 
-    pub fn status(&self, assoc: usize) -> Status { unimplemented!() }
+    pub fn status(&mut self, _assoc: usize) -> Status { unimplemented!() }
 
     pub fn poll(&mut self) -> Option<(usize, Event)> { self.events.pop_front() }
 
@@ -231,15 +248,12 @@ impl Endpoint {
             assoc_id = Some(id);
         }
 
-        let mut packet = packet;
-        while !packet.is_empty() {
-            let length = NetworkEndian::read_u16(&packet[2..4]);
+        for chunk in chunk_queue::Iter::new(packet) {
             if let Some(id) = assoc_id {
-                self.handle_assoc_chunk(now, source, id, &packet[0..length as usize]);
+                self.handle_assoc_chunk(now, source, id, chunk);
             } else {
-                self.handle_chunk(now, source, &packet[0..length as usize]);
+                self.handle_chunk(now, source, chunk);
             }
-            packet = &packet[length as usize..]
         }
     }
 
@@ -278,7 +292,7 @@ impl Endpoint {
                 tcb.out_streams.truncate(ack.value.max_inbound_streams as usize);
                 tcb.out_streams.shrink_to_fit();
                 let peer = self.peers.get_mut(&source).unwrap();
-                peer.rto.init(duration_ms(now - peer.last_time) as u32);
+                peer.rto.init(now - peer.last_time);
                 self.events.push_back((assoc_id, Event::TimerStart(TimerKind::Global(1), peer.rto.get())));
             }
             (State::CookieEchoed, chunk::CookieAck::TYPE) => {
@@ -291,6 +305,8 @@ impl Endpoint {
                     outbound_streams: tcb.out_streams.len() as u16,
                     inbound_streams: tcb.in_streams.len() as u16,
                 }));
+                let peer = self.peers.get_mut(&source).unwrap();
+                peer.rto.update(&self.params, now - peer.last_time);
             }
             (_, chunk::CookieAck::TYPE) => {} // §5.2.5
             _ => unimplemented!()
@@ -313,7 +329,9 @@ impl Endpoint {
                     max_inbound_streams: u16::max_value(),
                     tsn,
                 });
+
                 reply.param(chunk::Cookie {
+                    mac: *MacCode::from_slice(&[0; 64]),
                     local_verification_tag,
                     peer_verification_tag: init.value.tag,
                     timestamp: duration_ms(now - self.epoch),
@@ -321,6 +339,9 @@ impl Endpoint {
                     outbound_streams, tsn,
                     recv_tsn: init.value.tsn,
                 });
+
+                chunk::Cookie::write_mac(&self.mac_key, &mut reply[Chunk::<chunk::Init>::size() as usize + 4..]);
+
                 for (ty, value) in params {
                     match ty {
                         // TODO: Multihoming
@@ -337,8 +358,10 @@ impl Endpoint {
             }
             chunk::CookieEcho::TYPE => {
                 let (_, mut params) = tryopt!(Chunk::<chunk::CookieEcho>::decode(chunk));
-                let (_, cookie) = tryopt!(params.find(|&(ty, _)| ty == chunk::Cookie::TYPE));
-                let cookie = chunk::Cookie::decode(cookie);
+                let (_, cookie_data) = tryopt!(params.find(|&(ty, _)| ty == chunk::Cookie::TYPE));
+                if !chunk::Cookie::check_mac(&self.mac_key, cookie_data) { return; }
+                let cookie = chunk::Cookie::decode(cookie_data);
+
                 let rtt = now - (self.epoch + Duration::from_millis(cookie.timestamp));
                 if rtt > Duration::from_millis(self.params.valid_cookie_life as u64) {
                     // Stale cookie
@@ -365,7 +388,7 @@ impl Endpoint {
                 self.associations[id].out_streams.resize(cookie.outbound_streams as usize, StreamSeq(0));
                 self.associations[id].in_streams.resize(cookie.inbound_streams as usize, StreamSeq(0));
                 let mut rttimer = RoundTripTimer::new(self.params.rto_initial);
-                rttimer.init(duration_ms(rtt) as u32);
+                rttimer.init(rtt);
                 let mut peer = Peer::new(now, id, rttimer);
                 peer.send(now, chunk::CookieAck {});
                 self.peers.insert(source, peer);
@@ -471,13 +494,15 @@ impl RoundTripTimer {
         }
     }
 
-    pub fn init(&mut self, r: u32) {
+    pub fn init(&mut self, r: Duration) {
+        let r = duration_ms(r) as u32;
         self.srtt = r;
         self.rttvar = r/2;
         self.rto = self.srtt + 4 * self.rttvar;
     }
 
-    pub fn update(&mut self, params: &Parameters, r: u32) {
+    pub fn update(&mut self, params: &Parameters, r: Duration) {
+        let r = duration_ms(r) as u32;
         self.rttvar =
             self.rttvar - (self.rttvar >> params.rto_beta)
             + cmp::max(self.srtt, r) - cmp::min(self.srtt, r) >> params.rto_beta;
@@ -639,7 +664,7 @@ mod tests {
         assert!(!peer.out.is_empty());
         let (init, init_params) = Chunk::<chunk::Init>::decode(peer.out.iter().next().expect("no message")).expect("decode failed");
         assert_eq!(init.length, Chunk::<chunk::Init>::size());
-        assert_eq!(init.flags, chunk::InitFlags::empty());
+        assert_eq!(init.flags, chunk::InitFlags::from(0));
         assert_eq!(init.value.a_rwnd, proto_params.recv_window_initial);
         assert_eq!(init.value.outbound_streams, 17);
         assert_eq!(init_params.count(), 0);
@@ -678,7 +703,7 @@ mod tests {
 
         let mut client = Endpoint::new(proto_params, now, client_addr.port(), 1).unwrap();
 
-        let client_assoc = client.associate(now, server_addr, 1);
+        client.associate(now, server_addr, 1);
         let mut timed_out = false;
         while let Some((assoc, event)) = client.poll() {
             use Event::*;
