@@ -344,7 +344,7 @@ impl Endpoint {
             (State::CookieWait, chunk::Init::TYPE) => {
                 // §5.2.1 initialization collision
                 let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
-                self.send_duplicate_init_reply(now, source, assoc_id, &init, params, false);
+                self.send_duplicate_init_reply(now, source, assoc_id, &init, params, false, false);
             }
 
 
@@ -367,7 +367,7 @@ impl Endpoint {
                 // §5.2.1 initialization collision
                 let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
                 // TODO: Multihoming: Ensure no new addresses, otherwise respond with abort
-                self.send_duplicate_init_reply(now, source, assoc_id, &init, params, true);
+                self.send_duplicate_init_reply(now, source, assoc_id, &init, params, true, false);
             }
             (State::CookieEchoed, chunk::Error::TYPE) => {
                 // §5.2.6
@@ -392,7 +392,7 @@ impl Endpoint {
                 // §5.2.2
                 let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
                 // TODO: Multihoming: Ensure no new addresses, otherwise respond with abort
-                self.send_duplicate_init_reply(now, source, assoc_id, &init, params, true);
+                self.send_duplicate_init_reply(now, source, assoc_id, &init, params, true, true);
             }
             (_, chunk::ShutdownComplete::TYPE) => {} // §8.5.1 C
             (_, chunk::InitAck::TYPE) => {}          // §5.2.3
@@ -489,11 +489,13 @@ impl Endpoint {
     }
 
     fn send_duplicate_init_reply(&mut self, now: Instant, source: SocketAddr, assoc_id: usize,
-                                 init: &Chunk<chunk::Init>, params: chunk::ParamIter, tie_tags: bool) {
+                                 init: &Chunk<chunk::Init>, params: chunk::ParamIter,
+                                 tie_tags: bool, new_verification_tag: bool) {
         let tcb = &self.associations[assoc_id];
         self.out_meta.push((source, init.value.tag));
+        let local_verification_tag = if new_verification_tag { self.rng.gen() } else { tcb.local_verification_tag };
         let mut ack = self.out.push(chunk::InitAck {
-            tag: tcb.local_verification_tag,
+            tag: local_verification_tag,
             a_rwnd: self.params.recv_window_initial,
             outbound_streams: tcb.out_streams.len() as u16,
             max_inbound_streams: u16::max_value(),
@@ -501,7 +503,7 @@ impl Endpoint {
         });
         ack.param(chunk::Cookie {
             mac: *MacCode::from_slice(&[0; 64]),
-            local_verification_tag: tcb.local_verification_tag,
+            local_verification_tag,
             peer_verification_tag: init.value.tag,
             timestamp: duration_ms(now - self.epoch),
             inbound_streams: init.value.outbound_streams,
