@@ -27,8 +27,15 @@ use chunk::{Type, Wire, Param, Chunk, CommonHeader, ParamHeader};
 use chunk_queue::ChunkQueue;
 
 macro_rules! tryopt {
-    ($val:expr) => (if let Some(x) = $val { x } else { return; })
+    ($val:expr) => (if let Some(x) = $val { x } else { return Nil::NIL; })
 }
+
+trait Nil {
+    const NIL: Self;
+}
+
+impl Nil for () { const NIL: () = (); }
+impl<T> Nil for Option<T> { const NIL: Option<T> = None; }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct TransmitSeq(u32);
@@ -231,6 +238,7 @@ impl Endpoint {
     pub fn handle_packet(&mut self, now: Instant, source: IpAddr, packet: &[u8]) {
         if packet.len() <= CommonHeader::size() as usize { return; }
         let header = CommonHeader::decode(&packet);
+        if header.destination_port != self.port { return; }
 
         let crc = crc32c_hw::update(0, &packet[0..8]);
         let crc = crc32c_hw::update(crc, &[0, 0, 0, 0]);
@@ -240,25 +248,57 @@ impl Endpoint {
 
         let source = SocketAddr::new(source, header.source_port);
 
-        let mut assoc_id = None;
-        if let Some(id) = self.peers.get(&source).map(|x| x.association) {
-            let tcb = &mut self.associations[id];
-            // Discard packets with bad tags, per RFC 4960 §8.5
-            if header.verification_tag != tcb.local_verification_tag { return; } 
-            assoc_id = Some(id);
+        let chunk_count = chunk_queue::Iter::new(packet).count();
+
+        // §8.5.1 A: drop packets with 0 verification tag unless they only contain init
+        if header.verification_tag == 0 {
+            let mut iter = chunk_queue::Iter::new(packet);
+            let chunk = tryopt!(iter.next());
+            if chunk[0] != chunk::Init::TYPE { return; }
+            if chunk_count != 1 { return; }
+        }
+
+        let mut assoc_id = self.peers.get(&source).map(|x| x.association);
+        if let Some(id) = assoc_id {
+            if header.verification_tag != self.associations[id].local_verification_tag {
+                // Misc. §8.5.1 checks
+                if chunk_count != 1 { return; }
+                let chunk = chunk_queue::Iter::new(packet).next().unwrap();
+                match chunk[0] {
+                    chunk::Init::TYPE => {
+                        if header.verification_tag != 0 { return; }
+                    }
+                    chunk::Abort::TYPE => {
+                        if !chunk::AbortFlags::from(chunk[1]).contains(chunk::AbortFlags::T) ||
+                            header.verification_tag != self.associations[id].peer_verification_tag
+                        {
+                            return;
+                        }
+                    }
+                    chunk::ShutdownComplete::TYPE => {
+                        if !chunk::ShutdownCompleteFlags::from(chunk[1]).contains(chunk::ShutdownCompleteFlags::T) ||
+                            header.verification_tag != self.associations[id].peer_verification_tag
+                        {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
 
         for chunk in chunk_queue::Iter::new(packet) {
             if let Some(id) = assoc_id {
-                self.handle_assoc_chunk(now, source, id, chunk);
+                self.handle_assoc_chunk(now, source, header.verification_tag, id, chunk);
             } else {
-                self.handle_chunk(now, source, chunk);
+                assoc_id = self.handle_chunk(now, source, header.verification_tag, chunk);
             }
         }
+        // TODO: Early ack if we just associated *and* got data
     }
 
     /// Process a chunk from a peer in an existing association
-    fn handle_assoc_chunk(&mut self, now: Instant, source: SocketAddr, assoc_id: usize, chunk: &[u8]) {
+    fn handle_assoc_chunk(&mut self, now: Instant, source: SocketAddr, tag: u32, assoc_id: usize, chunk: &[u8]) {
         match (self.associations[assoc_id].state, chunk[0]) {
             (State::CookieWait, chunk::InitAck::TYPE) => {
                 let (ack, params) = tryopt!(Chunk::<chunk::InitAck>::decode(chunk));
@@ -295,6 +335,8 @@ impl Endpoint {
                 peer.rto.init(now - peer.last_time);
                 self.events.push_back((assoc_id, Event::TimerStart(TimerKind::Global(1), peer.rto.get())));
             }
+            // §8.5.1 E
+            (State::CookieWait, chunk::ShutdownAck::TYPE) => { self.handle_chunk(now, source, tag, chunk); }
             (State::CookieEchoed, chunk::CookieAck::TYPE) => {
                 tryopt!(Chunk::<chunk::CookieAck>::decode(chunk));
                 let tcb = &mut self.associations[assoc_id];
@@ -308,15 +350,38 @@ impl Endpoint {
                 let peer = self.peers.get_mut(&source).unwrap();
                 peer.rto.update(&self.params, now - peer.last_time);
             }
+            // §8.5.1 E
+            (State::CookieEchoed, chunk::ShutdownAck::TYPE) => { self.handle_chunk(now, source, tag, chunk); }
             (_, chunk::CookieAck::TYPE) => {} // §5.2.5
+            (State::CookieWait, chunk::Init::TYPE) => {
+                // §5.2.1 initialization collision
+                unimplemented!()
+            }
+            (State::CookieEchoed, chunk::Init::TYPE) => {
+                // §5.2.1 initialization collision
+                unimplemented!()
+            }
+            (State::ShutdownAckSent, chunk::Init::TYPE) => {
+                unimplemented!()
+            }
+            (_, chunk::Init::TYPE) => {
+                // §5.2.2
+                unimplemented!()
+            }
+            (State::ShutdownAckSent, chunk::ShutdownComplete::TYPE) => {
+                let (complete, _) = tryopt!(Chunk::<chunk::ShutdownComplete>::decode(chunk));
+                unimplemented!()
+            }
+            (_, chunk::ShutdownComplete::TYPE) => {} // §8.5.1 C
             _ => unimplemented!()
         }
     }
 
     /// Process a chunk from an unknown peer
-    fn handle_chunk(&mut self, now: Instant, source: SocketAddr, chunk: &[u8]) {
+    fn handle_chunk(&mut self, now: Instant, source: SocketAddr, verification_tag: u32, chunk: &[u8]) -> Option<usize> {
         match chunk[0] {
             chunk::Init::TYPE => {
+                if verification_tag != 0 { return None; }
                 let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
                 let outbound_streams = cmp::min(init.value.max_inbound_streams, self.outbound_streams);
                 let local_verification_tag = self.rng.gen();
@@ -359,8 +424,10 @@ impl Endpoint {
             chunk::CookieEcho::TYPE => {
                 let (_, mut params) = tryopt!(Chunk::<chunk::CookieEcho>::decode(chunk));
                 let (_, cookie_data) = tryopt!(params.find(|&(ty, _)| ty == chunk::Cookie::TYPE));
-                if !chunk::Cookie::check_mac(&self.mac_key, cookie_data) { return; }
+                if !chunk::Cookie::check_mac(&self.mac_key, cookie_data) { return None; } // §5.1.5 step 2
                 let cookie = chunk::Cookie::decode(cookie_data);
+
+                if cookie.local_verification_tag != verification_tag { return None; } // §5.1.5 step 3
 
                 let rtt = now - (self.epoch + Duration::from_millis(cookie.timestamp));
                 if rtt > Duration::from_millis(self.params.valid_cookie_life as u64) {
@@ -369,7 +436,7 @@ impl Endpoint {
                     self.out_meta.push((source, cookie.peer_verification_tag));
                     self.out.push(chunk::Error {})
                         .param(chunk::StaleCookieError { measure });
-                    return;
+                    return None;
                 } 
                 let id = self.associations.insert(Association {
                     state: State::Established,
@@ -396,11 +463,13 @@ impl Endpoint {
                     outbound_streams: cookie.outbound_streams,
                     inbound_streams: cookie.inbound_streams,
                 }));
+                return Some(id);
             }
-            // §3.3.7 says ignore aborts from unknown peers
-            chunk::Abort::TYPE => {}
+            chunk::Abort::TYPE => {} // §3.3.7 says ignore aborts from unknown peers
+            chunk::ShutdownComplete::TYPE => {} // §8.5.1 C
             _ => unimplemented!()
         }
+        None
     }
 
     /// Must only be called after processing timer start/stop events

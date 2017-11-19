@@ -127,9 +127,9 @@ impl<'a> Iter<'a> {
 impl<'a> Iterator for Iter<'a> {
     type Item = &'a [u8];
     fn next(&mut self) -> Option<&'a [u8]> {
-        if self.0.is_empty() { return None; }
+        if self.0.len() < 4 { return None; }
         let len = NetworkEndian::read_u16(&self.0[2..4]) as usize;
-        debug_assert!(len >= 4);
+        if len < 4 { return None; }
         let result = &self.0[0..len];
         self.0 = &self.0[len..];
         Some(result)

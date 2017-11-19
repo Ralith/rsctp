@@ -241,6 +241,13 @@ impl Field for MacCode {
     }
 }
 
+wire!{
+    Header,
+    ty: u8,
+    flags: u8,
+    length: u16,
+}
+
 pub struct Chunk<T: Type> {
     pub flags: T::Flags,
     pub length: u16,
@@ -260,6 +267,7 @@ impl<T: Type> Chunk<T> {
 
     pub fn decode(data: &[u8]) -> Option<(Self, ParamIter)> {
         if data.len() < (Self::size() as usize) { return None; }
+        debug_assert_eq!(data[0], T::TYPE);
         let length = NetworkEndian::read_u16(&data[2..4]);
         if data.len() < length as usize { return None; }
         let fixed_end = Self::size() as usize;
@@ -339,6 +347,11 @@ chunk!{
 }
 
 chunk!{
+    ShutdownAck = 8,
+    ShutdownAckFlags,
+}
+
+chunk!{
     Error = 9,
     ErrorFlags,
 }
@@ -351,6 +364,11 @@ chunk!{
 chunk!{
     CookieAck = 11,
     CookieAckFlags,
+}
+
+chunk!{
+    ShutdownComplete = 14,
+    ShutdownCompleteFlags { T = 0b1 },
 }
 
 pub struct ParamIter<'a>(&'a [u8]);
