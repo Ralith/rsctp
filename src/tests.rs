@@ -35,6 +35,23 @@ fn transmit(now: Instant, send: &mut Endpoint, send_addr: SocketAddr, recv: &mut
     send.out.clear();
 }
 
+fn run_handshake(now: Instant,
+             mut client: &mut Endpoint, client_addr: SocketAddr,
+             mut server: &mut Endpoint, server_addr: SocketAddr) -> (usize, usize)
+{
+    let client_assoc = client.associate(now, server_addr, 1);
+    assert_eq!(client.associations[client_assoc].state, State::CookieWait);
+    transmit(now, &mut client, client_addr, &mut server, server_addr);
+    transmit(now, &mut server, server_addr, &mut client, client_addr);
+    assert_eq!(client.associations[client_assoc].state, State::CookieEchoed);
+    transmit(now, &mut client, client_addr, &mut server, server_addr);
+    transmit(now, &mut server, server_addr, &mut client, client_addr);
+    assert_eq!(client.associations[client_assoc].state, State::Established);
+    let server_assoc = server.peers.get(&client_addr).expect("server missing client peer").association;
+    assert_eq!(server.associations[server_assoc].state, State::Established);
+    (client_assoc, server_assoc)
+}
+
 #[test]
 fn init_message() {
     let proto_params = Parameters::default();
@@ -62,16 +79,7 @@ fn handshake() {
     let mut client = Endpoint::new(proto_params, now, client_addr.port(), 1).unwrap();
     let mut server = Endpoint::new(proto_params, now, server_addr.port(), 1).unwrap();
 
-    let client_assoc = client.associate(now, server_addr, 1);
-    assert_eq!(client.associations[client_assoc].state, State::CookieWait);
-    transmit(now, &mut client, client_addr, &mut server, server_addr);
-    transmit(now, &mut server, server_addr, &mut client, client_addr);
-    assert_eq!(client.associations[client_assoc].state, State::CookieEchoed);
-    transmit(now, &mut client, client_addr, &mut server, server_addr);
-    transmit(now, &mut server, server_addr, &mut client, client_addr);
-    assert_eq!(client.associations[client_assoc].state, State::Established);
-    let server_assoc = server.peers.get(&client_addr).expect("server missing client peer").association;
-    assert_eq!(server.associations[server_assoc].state, State::Established);
+    run_handshake(now, &mut client, client_addr, &mut server, server_addr);
 }
 
 #[test]
@@ -136,4 +144,91 @@ fn cookie_echo_timeout() {
         }
     }
     assert!(timed_out);
+}
+
+#[test]
+fn init_collision_1() {
+    let proto_params = Parameters::default();
+    let now = Instant::now();
+
+    let a_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42);
+    let b_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 24);
+
+    let mut a = Endpoint::new(proto_params, now, a_addr.port(), 1).unwrap();
+    let mut b = Endpoint::new(proto_params, now, b_addr.port(), 1).unwrap();
+
+    let a_assoc = a.associate(now, b_addr, 1);
+    let b_assoc = b.associate(now, a_addr, 1);
+    assert_eq!(a.associations[a_assoc].state, State::CookieWait);
+    assert_eq!(b.associations[b_assoc].state, State::CookieWait);
+    transmit(now, &mut a, a_addr, &mut b, b_addr);
+    transmit(now, &mut b, b_addr, &mut a, a_addr);
+    assert_eq!(a.associations[a_assoc].state, State::CookieEchoed);
+    transmit(now, &mut a, a_addr, &mut b, b_addr);
+    assert_eq!(b.associations[b_assoc].state, State::Established);
+    transmit(now, &mut b, b_addr, &mut a, a_addr);
+    assert_eq!(a.associations[a_assoc].state, State::Established);
+    assert_eq!(a.associations.len(), 1);
+    assert_eq!(b.associations.len(), 1);
+}
+
+#[test]
+fn init_collision_2() {
+    let proto_params = Parameters::default();
+    let now = Instant::now();
+
+    let a_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42);
+    let b_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 24);
+
+    let mut a = Endpoint::new(proto_params, now, a_addr.port(), 1).unwrap();
+    let mut b = Endpoint::new(proto_params, now, b_addr.port(), 1).unwrap();
+
+    let a_assoc = a.associate(now, b_addr, 1);
+    assert_eq!(a.associations[a_assoc].state, State::CookieWait);
+    transmit(now, &mut a, a_addr, &mut b, b_addr);
+    transmit(now, &mut b, b_addr, &mut a, a_addr);
+    assert_eq!(a.associations[a_assoc].state, State::CookieEchoed);
+    let b_assoc = b.associate(now, a_addr, 1);
+    assert_eq!(b.associations[b_assoc].state, State::CookieWait);
+    transmit(now, &mut b, b_addr, &mut a, a_addr);
+    transmit(now, &mut a, a_addr, &mut b, b_addr);
+    assert_eq!(b.associations[b_assoc].state, State::CookieEchoed);
+    assert_eq!(a.associations[a_assoc].state, State::CookieEchoed);
+    transmit(now, &mut b, b_addr, &mut a, a_addr);
+    assert_eq!(a.associations[a_assoc].state, State::Established);
+    assert_eq!(a.associations.len(), 1);
+    assert_eq!(b.associations.len(), 1);
+}
+
+#[test]
+fn restart() {
+    let proto_params = Parameters::default();
+    let now = Instant::now();
+
+    let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42);
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 24);
+
+    let mut client = Endpoint::new(proto_params, now, client_addr.port(), 1).unwrap();
+    let mut server = Endpoint::new(proto_params, now, server_addr.port(), 1).unwrap();
+
+    let (_, server_assoc) = run_handshake(now, &mut client, client_addr, &mut server, server_addr);
+    client = Endpoint::new(proto_params, now, client_addr.port(), 1).unwrap();
+    let client_assoc = client.associate(now, server_addr, 1);
+    assert_eq!(client.associations[client_assoc].state, State::CookieWait);
+    transmit(now, &mut client, client_addr, &mut server, server_addr);
+    transmit(now, &mut server, server_addr, &mut client, client_addr);
+    assert_eq!(client.associations[client_assoc].state, State::CookieEchoed);
+    transmit(now, &mut client, client_addr, &mut server, server_addr);
+    transmit(now, &mut server, server_addr, &mut client, client_addr);
+    assert_eq!(client.associations[client_assoc].state, State::Established);
+    assert_eq!(server.associations[server_assoc].state, State::Established);
+    let mut restarted = false;
+    while let Some((assoc, event)) = server.poll() {
+        use Event::*;
+        match event {
+            Restart { .. } => { restarted = true; }
+            _ => {}
+        }
+    }
+    assert!(restarted);
 }
