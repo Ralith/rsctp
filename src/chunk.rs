@@ -150,6 +150,7 @@ param!{
     timestamp: u64,
     tsn: TransmitSeq,
     recv_tsn: TransmitSeq,
+    tie_tags: u64,
 }
 
 impl Cookie {

@@ -204,6 +204,7 @@ impl Endpoint {
             cumul_tsn_ack: tsn - 1,
             remote_cookie: None,
             init_retransmits: 0,
+            tie_tags: self.rng.gen(),
         });
         self.associations[id].out_streams.resize(streams as usize, StreamSeq(0));
         let mut peer = Peer::new(now, id, RoundTripTimer::new(self.params.rto_initial));
@@ -337,6 +338,13 @@ impl Endpoint {
             }
             // §8.5.1 E
             (State::CookieWait, chunk::ShutdownAck::TYPE) => { self.handle_chunk(now, source, tag, chunk); }
+            (State::CookieWait, chunk::Init::TYPE) => {
+                // §5.2.1 initialization collision
+                let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
+                self.send_duplicate_init_reply(now, source, assoc_id, &init, params, false);
+            }
+
+
             (State::CookieEchoed, chunk::CookieAck::TYPE) => {
                 tryopt!(Chunk::<chunk::CookieAck>::decode(chunk));
                 let tcb = &mut self.associations[assoc_id];
@@ -352,28 +360,166 @@ impl Endpoint {
             }
             // §8.5.1 E
             (State::CookieEchoed, chunk::ShutdownAck::TYPE) => { self.handle_chunk(now, source, tag, chunk); }
-            (_, chunk::CookieAck::TYPE) => {} // §5.2.5
-            (State::CookieWait, chunk::Init::TYPE) => {
-                // §5.2.1 initialization collision
-                unimplemented!()
-            }
             (State::CookieEchoed, chunk::Init::TYPE) => {
                 // §5.2.1 initialization collision
-                unimplemented!()
+                let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
+                // TODO: Multihoming: Ensure no new addresses, otherwise respond with abort
+                self.send_duplicate_init_reply(now, source, assoc_id, &init, params, true);
             }
+            (State::CookieEchoed, chunk::Error::TYPE) => {
+                // §5.2.6
+                let (_, mut params) = tryopt!(Chunk::<chunk::Error>::decode(chunk));
+                tryopt!(params.find(|&(ty, _)| ty == chunk::StaleCookieError::TYPE));
+                self.remove_assoc(assoc_id, Some(ErrorKind::StaleCookie));
+            }
+
+
             (State::ShutdownAckSent, chunk::Init::TYPE) => {
-                unimplemented!()
-            }
-            (_, chunk::Init::TYPE) => {
-                // §5.2.2
-                unimplemented!()
+                // §9.2: lost SHUTDOWN COMPLETE
+                let peer = self.peers.get_mut(&source).unwrap();
+                peer.send(now, chunk::ShutdownAck {});
             }
             (State::ShutdownAckSent, chunk::ShutdownComplete::TYPE) => {
                 let (complete, _) = tryopt!(Chunk::<chunk::ShutdownComplete>::decode(chunk));
                 unimplemented!()
             }
+
+
+            (_, chunk::Init::TYPE) => {
+                // §5.2.2
+                let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
+                // TODO: Multihoming: Ensure no new addresses, otherwise respond with abort
+                self.send_duplicate_init_reply(now, source, assoc_id, &init, params, true);
+            }
             (_, chunk::ShutdownComplete::TYPE) => {} // §8.5.1 C
+            (_, chunk::InitAck::TYPE) => {}          // §5.2.3
+            (_, chunk::CookieEcho::TYPE) => {
+                // §5.2.4
+                let (_, mut params) = tryopt!(Chunk::<chunk::CookieEcho>::decode(chunk));
+                let (_, cookie_data) = tryopt!(params.find(|&(ty, _)| ty == chunk::Cookie::TYPE));
+                if !chunk::Cookie::check_mac(&self.mac_key, cookie_data) { return; } // §5.1.5 step 2
+                let cookie = chunk::Cookie::decode(cookie_data);
+
+                let tcb = &mut self.associations[assoc_id];
+
+                // §5.2.4 action D
+                if cookie.local_verification_tag == tcb.local_verification_tag
+                    && cookie.peer_verification_tag == tcb.peer_verification_tag
+                {
+                    if tcb.state == State::CookieEchoed {
+                        tcb.state = State::Established;
+                        self.events.push_back((assoc_id, Event::TimerStop(TimerKind::Global(1))));
+                        self.events.push_back((assoc_id, Event::CommunicationUp {
+                            outbound_streams: tcb.out_streams.len() as u16,
+                            inbound_streams: tcb.in_streams.len() as u16,
+                        }));
+                    }
+                    let peer = self.peers.get_mut(&tcb.primary_path).unwrap();
+                    peer.send(now, chunk::CookieAck {});
+                    return;
+                }
+
+                let rtt = now - (self.epoch + Duration::from_millis(cookie.timestamp));
+                if rtt > Duration::from_millis(self.params.valid_cookie_life as u64) {
+                    // Stale cookie
+                    let measure = 1000 * (duration_ms(rtt) as u32 - self.params.valid_cookie_life);
+                    self.out_meta.push((source, cookie.peer_verification_tag));
+                    self.out.push(chunk::Error {})
+                        .param(chunk::StaleCookieError { measure });
+                    return;
+                }
+
+                if cookie.tie_tags == tcb.tie_tags
+                    && cookie.local_verification_tag != tcb.local_verification_tag
+                    && cookie.peer_verification_tag != tcb.peer_verification_tag
+                {
+                    // §5.2.4 action A: Peer restarted
+                    // TODO: Reset cwnd, ssthresh
+                    let old_state = tcb.state;
+                    tcb.state = State::Established;
+                    tcb.peer_verification_tag = cookie.peer_verification_tag;
+                    tcb.local_verification_tag = cookie.local_verification_tag;
+                    tcb.primary_path = source;
+                    tcb.out_streams = vec![StreamSeq(0); cookie.outbound_streams as usize];
+                    tcb.in_streams = vec![StreamSeq(0); cookie.inbound_streams as usize];
+                    tcb.next_tsn = cookie.tsn + 1;
+                    tcb.last_recv_tsn = cookie.recv_tsn; // - 1?
+                    tcb.tie_tags = self.rng.gen();
+                    let mut rttimer = RoundTripTimer::new(self.params.rto_initial);
+                    rttimer.init(rtt);
+                    let mut peer = Peer::new(now, assoc_id, rttimer);
+                    peer.send(now, chunk::CookieAck {});
+                    self.peers.insert(source, peer);
+                    let event = if old_state == State::Established {
+                        Event::Restart {
+                            outbound_streams: cookie.outbound_streams,
+                            inbound_streams: cookie.inbound_streams,
+                        }
+                    } else {
+                        Event::CommunicationUp {
+                            outbound_streams: cookie.outbound_streams,
+                            inbound_streams: cookie.inbound_streams,
+                        }
+                    };
+                    self.events.push_back((assoc_id, event));
+                } else if cookie.local_verification_tag == tcb.local_verification_tag
+                    && cookie.peer_verification_tag != tcb.peer_verification_tag
+                {
+                    // §5.2.4 action B: initialization collision
+                    if tcb.state != State::Established {
+                        tcb.state = State::Established;
+                        self.events.push_back((assoc_id, Event::TimerStop(TimerKind::Global(1))));
+                        self.events.push_back((assoc_id, Event::CommunicationUp {
+                            outbound_streams: tcb.out_streams.len() as u16,
+                            inbound_streams: tcb.in_streams.len() as u16,
+                        }));
+                    }
+                    tcb.peer_verification_tag = cookie.peer_verification_tag;
+                    let peer = self.peers.get_mut(&tcb.primary_path).unwrap();
+                    peer.send(now, chunk::CookieAck {});
+                }
+                // Otherwise, §5.2.4 action C: ignore cookie
+            }
+            (_, chunk::CookieAck::TYPE) => {} // §5.2.5
             _ => unimplemented!()
+        }
+    }
+
+    fn send_duplicate_init_reply(&mut self, now: Instant, source: SocketAddr, assoc_id: usize,
+                                 init: &Chunk<chunk::Init>, params: chunk::ParamIter, tie_tags: bool) {
+        let tcb = &self.associations[assoc_id];
+        self.out_meta.push((source, init.value.tag));
+        let mut ack = self.out.push(chunk::InitAck {
+            tag: tcb.local_verification_tag,
+            a_rwnd: self.params.recv_window_initial,
+            outbound_streams: tcb.out_streams.len() as u16,
+            max_inbound_streams: u16::max_value(),
+            tsn: tcb.next_tsn - 1,
+        });
+        ack.param(chunk::Cookie {
+            mac: *MacCode::from_slice(&[0; 64]),
+            local_verification_tag: tcb.local_verification_tag,
+            peer_verification_tag: init.value.tag,
+            timestamp: duration_ms(now - self.epoch),
+            inbound_streams: init.value.outbound_streams,
+            outbound_streams: tcb.out_streams.len() as u16,
+            tsn: tcb.next_tsn - 1,
+            recv_tsn: init.value.tsn,
+            tie_tags: if tie_tags { tcb.tie_tags } else { 0 },
+        });
+        chunk::Cookie::write_mac(&self.mac_key, &mut ack[Chunk::<chunk::Init>::size() as usize + 4..]);
+        for (ty, value) in params {
+            match ty {
+                // TODO: Multihoming
+                _ => {
+                    if ParamHeader::report(ty) {
+                        ack.param(chunk::UnrecognizedParameter { ty, value });
+                    }
+                    if ParamHeader::stop(ty) {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -403,6 +549,7 @@ impl Endpoint {
                     inbound_streams: init.value.outbound_streams,
                     outbound_streams, tsn,
                     recv_tsn: init.value.tsn,
+                    tie_tags: 0,
                 });
 
                 chunk::Cookie::write_mac(&self.mac_key, &mut reply[Chunk::<chunk::Init>::size() as usize + 4..]);
@@ -437,23 +584,22 @@ impl Endpoint {
                     self.out.push(chunk::Error {})
                         .param(chunk::StaleCookieError { measure });
                     return None;
-                } 
+                }
                 let id = self.associations.insert(Association {
                     state: State::Established,
                     peer_verification_tag: cookie.peer_verification_tag,
                     local_verification_tag: cookie.local_verification_tag,
                     primary_path: source,
-                    in_streams: Vec::new(),
-                    out_streams: Vec::new(),
+                    in_streams: vec![StreamSeq(0); cookie.inbound_streams as usize],
+                    out_streams: vec![StreamSeq(0); cookie.outbound_streams as usize],
                     next_tsn: cookie.tsn + 1,
                     last_recv_tsn: cookie.recv_tsn, // - 1?
                     ack_state: 0,
                     cumul_tsn_ack: cookie.tsn - 1,
                     remote_cookie: None,
                     init_retransmits: 0,
+                    tie_tags: self.rng.gen(),
                 });
-                self.associations[id].out_streams.resize(cookie.outbound_streams as usize, StreamSeq(0));
-                self.associations[id].in_streams.resize(cookie.inbound_streams as usize, StreamSeq(0));
                 let mut rttimer = RoundTripTimer::new(self.params.rto_initial);
                 rttimer.init(rtt);
                 let mut peer = Peer::new(now, id, rttimer);
@@ -540,6 +686,7 @@ struct Association {
     last_recv_tsn: TransmitSeq,
     ack_state: u8,
     cumul_tsn_ack: TransmitSeq,
+    tie_tags: u64,
 
     /// Used only in state CookieEchoed to support retransmits
     remote_cookie: Option<Box<[u8]>>,
@@ -669,6 +816,8 @@ pub enum ErrorKind {
     Protocol,
     /// Peer is not responding
     Timeout,
+    /// Couldn't complete the handshake within the time limit set by the peer
+    StaleCookie,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -678,7 +827,7 @@ pub enum Event {
     CommunicationUp { outbound_streams: u16, inbound_streams: u16 },
     CommunicationLost { reason: Option<ErrorKind> },
     CommunicationError { reason: ErrorKind },
-    Restart,
+    Restart { outbound_streams: u16, inbound_streams: u16 },
     ShutdownComplete,
 
     TimerStart(TimerKind, Duration),
