@@ -39,7 +39,6 @@ trait Nil {
 
 impl Nil for () { const NIL: () = (); }
 impl<T> Nil for Option<T> { const NIL: Option<T> = None; }
-impl<T, E: Nil> Nil for Result<T, E> { const NIL: Self = Err(E::NIL); }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct TransmitSeq(u32);
@@ -328,8 +327,8 @@ impl Endpoint {
                 self.handle_assoc_chunk(now, source, header.verification_tag, id, chunk);
             } else {
                 match self.handle_ootb_chunk(now, source, header.verification_tag, chunk) {
-                    Ok(id) => { assoc_id = Some(id); }
-                    Err(()) => { break; }
+                    OotbResult::Established(id) => { assoc_id = Some(id); }
+                    OotbResult::Halt => { break; }
                 }
             }
         }
@@ -567,10 +566,10 @@ impl Endpoint {
     /// Process an "out of the blue" chunk, i.e. one from an unknown peer
     ///
     /// Returns `Ok(_)` on association established; `Err(())` if the packet should not be processed further.
-    fn handle_ootb_chunk(&mut self, now: Instant, source: SocketAddr, verification_tag: u32, chunk: &[u8]) -> Result<usize, ()> {
+    fn handle_ootb_chunk(&mut self, now: Instant, source: SocketAddr, verification_tag: u32, chunk: &[u8]) -> OotbResult {
         match chunk[0] {
             chunk::Init::TYPE => {
-                if verification_tag != 0 { return Err(()); }
+                if verification_tag != 0 { return OotbResult::Halt; }
                 let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
                 let outbound_streams = cmp::min(init.value.max_inbound_streams, self.outbound_streams);
                 let local_verification_tag = self.rng.gen();
@@ -610,15 +609,15 @@ impl Endpoint {
                         }
                     }
                 }
-                Err(())
+                OotbResult::Halt
             }
             chunk::CookieEcho::TYPE => {
                 let (_, mut params) = tryopt!(Chunk::<chunk::CookieEcho>::decode(chunk));
                 let (_, cookie_data) = tryopt!(params.find(|&(ty, _)| ty == chunk::Cookie::TYPE));
-                if !chunk::Cookie::check_mac(&self.mac_key, cookie_data) { return Err(()); } // §5.1.5 step 2
+                if !chunk::Cookie::check_mac(&self.mac_key, cookie_data) { return OotbResult::Halt; } // §5.1.5 step 2
                 let cookie = chunk::Cookie::decode(cookie_data);
 
-                if cookie.local_verification_tag != verification_tag { return Err(()); } // §5.1.5 step 3
+                if cookie.local_verification_tag != verification_tag { return OotbResult::Halt; } // §5.1.5 step 3
 
                 let rtt = now - (self.epoch + Duration::from_millis(cookie.timestamp));
                 if rtt > Duration::from_millis(self.params.valid_cookie_life as u64) {
@@ -626,7 +625,7 @@ impl Endpoint {
                     let measure = 1000 * (duration_ms(rtt) as u32 - self.params.valid_cookie_life);
                     self.send_ootb(source, cookie.peer_verification_tag, chunk::Error {})
                         .param(chunk::StaleCookieError { measure });
-                    return Err(());
+                    return OotbResult::Halt;
                 }
                 let id = self.associations.insert(Association {
                     state: State::Established,
@@ -652,12 +651,12 @@ impl Endpoint {
                     outbound_streams: cookie.outbound_streams,
                     inbound_streams: cookie.inbound_streams,
                 }));
-                Ok(id)
+                OotbResult::Established(id)
             }
             chunk::ShutdownAck::TYPE => { // §8.4 step 5
                 tryopt!(Chunk::<chunk::ShutdownAck>::decode(chunk));
                 self.send_ootb(source, verification_tag, chunk::ShutdownComplete {}).flags(chunk::ShutdownCompleteFlags::T);
-                Err(())
+                OotbResult::Halt
             }
             chunk::Error::TYPE => {
                 // §5.2.6
@@ -665,11 +664,11 @@ impl Endpoint {
                 if params.find(|&(ty, _)| ty == chunk::StaleCookieError::TYPE).is_none() {
                     self.send_ootb(source, verification_tag, chunk::Abort {}).flags(chunk::AbortFlags::T);
                 }
-                Err(())
+                OotbResult::Halt
             }
             _ => {              // §8.4 step 8
                 self.send_ootb(source, verification_tag, chunk::Abort {}).flags(chunk::AbortFlags::T);
-                Err(())
+                OotbResult::Halt
             }
         }
     }
@@ -930,3 +929,10 @@ fn compute_header<'a, I>(source_port: u16, destination_port: u16, verification_t
         checksum: crc,
     }
 }
+
+enum OotbResult {
+    Established(usize),
+    Halt
+}
+
+impl Nil for OotbResult { const NIL: Self = OotbResult::Halt; }
