@@ -39,6 +39,7 @@ trait Nil {
 
 impl Nil for () { const NIL: () = (); }
 impl<T> Nil for Option<T> { const NIL: Option<T> = None; }
+impl<T, E: Nil> Nil for Result<T, E> { const NIL: Self = Err(E::NIL); }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct TransmitSeq(u32);
@@ -226,8 +227,9 @@ impl Endpoint {
     pub fn shutdown(&mut self, _assoc: usize) { unimplemented!() }
 
     pub fn abort(&mut self, assoc: usize) {
-        self.out_meta.push((self.associations[assoc].primary_path, self.associations[assoc].peer_verification_tag));
-        self.out.push(chunk::Abort {});
+        let addr = self.associations[assoc].primary_path;
+        let tag = self.associations[assoc].peer_verification_tag;
+        self.send_ootb(addr, tag, chunk::Abort {});
         self.remove_assoc(assoc, None);
     }
 
@@ -289,13 +291,29 @@ impl Endpoint {
                     _ => {}
                 }
             }
+        } else {
+            // §8.4 checks
+            // 1
+            match source.ip() {
+                IpAddr::V4(x) => if x.is_broadcast() { return; }
+                IpAddr::V6(x) => if x.is_multicast() { return; }
+            }
+            // 2
+            if chunk_queue::Iter::new(packet).find(|x| {
+                x[0] == chunk::Abort::TYPE
+                    || x[0] == chunk::ShutdownComplete::TYPE
+                    || x[0] == chunk::CookieAck::TYPE
+            }).is_some() { return; }
         }
 
         for chunk in chunk_queue::Iter::new(packet) {
             if let Some(id) = assoc_id {
                 self.handle_assoc_chunk(now, source, header.verification_tag, id, chunk);
             } else {
-                assoc_id = self.handle_chunk(now, source, header.verification_tag, chunk);
+                match self.handle_ootb_chunk(now, source, header.verification_tag, chunk) {
+                    Ok(id) => { assoc_id = Some(id); }
+                    Err(()) => { break; }
+                }
             }
         }
         // TODO: Early ack if we just associated *and* got data
@@ -321,8 +339,7 @@ impl Endpoint {
 
                 if self.associations[assoc_id].remote_cookie.is_none() {
                     // Cookie is required
-                    self.out_meta.push((source, ack.value.tag));
-                    self.out.push(chunk::Abort {});
+                    self.send_ootb(source, ack.value.tag, chunk::Abort {});
                     self.remove_assoc(assoc_id, Some(ErrorKind::Protocol));
                     return;
                 }
@@ -340,7 +357,7 @@ impl Endpoint {
                 self.events.push_back((assoc_id, Event::TimerStart(TimerKind::Global(1), peer.rto.get())));
             }
             // §8.5.1 E
-            (State::CookieWait, chunk::ShutdownAck::TYPE) => { self.handle_chunk(now, source, tag, chunk); }
+            (State::CookieWait, chunk::ShutdownAck::TYPE) => { self.handle_ootb_chunk(now, source, tag, chunk); }
             (State::CookieWait, chunk::Init::TYPE) => {
                 // §5.2.1 initialization collision
                 let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
@@ -362,7 +379,7 @@ impl Endpoint {
                 peer.rto.update(&self.params, now - peer.last_time);
             }
             // §8.5.1 E
-            (State::CookieEchoed, chunk::ShutdownAck::TYPE) => { self.handle_chunk(now, source, tag, chunk); }
+            (State::CookieEchoed, chunk::ShutdownAck::TYPE) => { self.handle_ootb_chunk(now, source, tag, chunk); }
             (State::CookieEchoed, chunk::Init::TYPE) => {
                 // §5.2.1 initialization collision
                 let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
@@ -403,35 +420,36 @@ impl Endpoint {
                 if !chunk::Cookie::check_mac(&self.mac_key, cookie_data) { return; } // §5.1.5 step 2
                 let cookie = chunk::Cookie::decode(cookie_data);
 
-                let tcb = &mut self.associations[assoc_id];
-
-                // §5.2.4 action D
-                if cookie.local_verification_tag == tcb.local_verification_tag
-                    && cookie.peer_verification_tag == tcb.peer_verification_tag
                 {
-                    if tcb.state == State::CookieEchoed {
-                        tcb.state = State::Established;
-                        self.events.push_back((assoc_id, Event::TimerStop(TimerKind::Global(1))));
-                        self.events.push_back((assoc_id, Event::CommunicationUp {
-                            outbound_streams: tcb.out_streams.len() as u16,
-                            inbound_streams: tcb.in_streams.len() as u16,
-                        }));
+                    let tcb = &mut self.associations[assoc_id];
+                    // §5.2.4 action D
+                    if cookie.local_verification_tag == tcb.local_verification_tag
+                        && cookie.peer_verification_tag == tcb.peer_verification_tag
+                    {
+                        if tcb.state == State::CookieEchoed {
+                            tcb.state = State::Established;
+                            self.events.push_back((assoc_id, Event::TimerStop(TimerKind::Global(1))));
+                            self.events.push_back((assoc_id, Event::CommunicationUp {
+                                outbound_streams: tcb.out_streams.len() as u16,
+                                inbound_streams: tcb.in_streams.len() as u16,
+                            }));
+                        }
+                        let peer = self.peers.get_mut(&tcb.primary_path).unwrap();
+                        peer.send(now, chunk::CookieAck {});
+                        return;
                     }
-                    let peer = self.peers.get_mut(&tcb.primary_path).unwrap();
-                    peer.send(now, chunk::CookieAck {});
-                    return;
                 }
 
                 let rtt = now - (self.epoch + Duration::from_millis(cookie.timestamp));
                 if rtt > Duration::from_millis(self.params.valid_cookie_life as u64) {
                     // Stale cookie
                     let measure = 1000 * (duration_ms(rtt) as u32 - self.params.valid_cookie_life);
-                    self.out_meta.push((source, cookie.peer_verification_tag));
-                    self.out.push(chunk::Error {})
+                    self.send_ootb(source, cookie.peer_verification_tag, chunk::Error {})
                         .param(chunk::StaleCookieError { measure });
                     return;
                 }
 
+                let tcb = &mut self.associations[assoc_id];
                 if cookie.tie_tags == tcb.tie_tags
                     && cookie.local_verification_tag != tcb.local_verification_tag
                     && cookie.peer_verification_tag != tcb.peer_verification_tag
@@ -528,11 +546,13 @@ impl Endpoint {
         }
     }
 
-    /// Process a chunk from an unknown peer
-    fn handle_chunk(&mut self, now: Instant, source: SocketAddr, verification_tag: u32, chunk: &[u8]) -> Option<usize> {
+    /// Process an "out of the blue" chunk, i.e. one from an unknown peer
+    ///
+    /// Returns `Ok(_)` on association established; `Err(())` if the packet should not be processed further.
+    fn handle_ootb_chunk(&mut self, now: Instant, source: SocketAddr, verification_tag: u32, chunk: &[u8]) -> Result<usize, ()> {
         match chunk[0] {
             chunk::Init::TYPE => {
-                if verification_tag != 0 { return None; }
+                if verification_tag != 0 { return Err(()); }
                 let (init, params) = tryopt!(Chunk::<chunk::Init>::decode(chunk));
                 let outbound_streams = cmp::min(init.value.max_inbound_streams, self.outbound_streams);
                 let local_verification_tag = self.rng.gen();
@@ -572,23 +592,23 @@ impl Endpoint {
                         }
                     }
                 }
+                Err(())
             }
             chunk::CookieEcho::TYPE => {
                 let (_, mut params) = tryopt!(Chunk::<chunk::CookieEcho>::decode(chunk));
                 let (_, cookie_data) = tryopt!(params.find(|&(ty, _)| ty == chunk::Cookie::TYPE));
-                if !chunk::Cookie::check_mac(&self.mac_key, cookie_data) { return None; } // §5.1.5 step 2
+                if !chunk::Cookie::check_mac(&self.mac_key, cookie_data) { return Err(()); } // §5.1.5 step 2
                 let cookie = chunk::Cookie::decode(cookie_data);
 
-                if cookie.local_verification_tag != verification_tag { return None; } // §5.1.5 step 3
+                if cookie.local_verification_tag != verification_tag { return Err(()); } // §5.1.5 step 3
 
                 let rtt = now - (self.epoch + Duration::from_millis(cookie.timestamp));
                 if rtt > Duration::from_millis(self.params.valid_cookie_life as u64) {
                     // Stale cookie
                     let measure = 1000 * (duration_ms(rtt) as u32 - self.params.valid_cookie_life);
-                    self.out_meta.push((source, cookie.peer_verification_tag));
-                    self.out.push(chunk::Error {})
+                    self.send_ootb(source, cookie.peer_verification_tag, chunk::Error {})
                         .param(chunk::StaleCookieError { measure });
-                    return None;
+                    return Err(());
                 }
                 let id = self.associations.insert(Association {
                     state: State::Established,
@@ -614,13 +634,31 @@ impl Endpoint {
                     outbound_streams: cookie.outbound_streams,
                     inbound_streams: cookie.inbound_streams,
                 }));
-                return Some(id);
+                Ok(id)
             }
-            chunk::Abort::TYPE => {} // §3.3.7 says ignore aborts from unknown peers
-            chunk::ShutdownComplete::TYPE => {} // §8.5.1 C
-            _ => unimplemented!()
+            chunk::ShutdownAck::TYPE => { // §8.4 step 5
+                tryopt!(Chunk::<chunk::ShutdownAck>::decode(chunk));
+                self.send_ootb(source, verification_tag, chunk::ShutdownComplete {}).flags(chunk::ShutdownCompleteFlags::T);
+                Err(())
+            }
+            chunk::Error::TYPE => {
+                // §5.2.6
+                let (_, mut params) = tryopt!(Chunk::<chunk::Error>::decode(chunk));
+                if params.find(|&(ty, _)| ty == chunk::StaleCookieError::TYPE).is_none() {
+                    self.send_ootb(source, verification_tag, chunk::Abort {}).flags(chunk::AbortFlags::T);
+                }
+                Err(())
+            }
+            _ => {              // §8.4 step 8
+                self.send_ootb(source, verification_tag, chunk::Abort {}).flags(chunk::AbortFlags::T);
+                Err(())
+            }
         }
-        None
+    }
+
+    fn send_ootb<T: chunk::Type>(&mut self, dest: SocketAddr, tag: u32, x: T) -> chunk_queue::ParamsBuilder<T> {
+        self.out_meta.push((dest, tag));
+        self.out.push(x)
     }
 
     /// Must only be called after processing timer start/stop events
