@@ -293,6 +293,21 @@ impl Endpoint {
                     _ => {}
                 }
             }
+
+            // Handle aborts
+            for chunk in chunk_queue::Iter::new(packet) {
+                if chunk[0] == chunk::Abort::TYPE {
+                    if let Some((_, mut params)) = Chunk::<chunk::Abort>::decode(chunk) {
+                        let reason = if let Some((_, reason)) = params.find(|&(ty, _)| ty == chunk::UserInitiatedAbort::TYPE) {
+                            ErrorKind::UserInitiatedAbort { reason: reason.to_vec() }
+                        } else {
+                            ErrorKind::Abort
+                        };
+                        self.remove_assoc(id, Some(reason));
+                        return;
+                    }
+                }
+            }
         } else {
             // §8.4 checks
             // 1
@@ -504,6 +519,7 @@ impl Endpoint {
                 // Otherwise, §5.2.4 action C: ignore cookie
             }
             (_, chunk::CookieAck::TYPE) => {} // §5.2.5
+            (_, chunk::Abort::TYPE) => unreachable!(),
             _ => unimplemented!()
         }
     }
@@ -855,7 +871,7 @@ impl Peer {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum ErrorKind {
     /// Peer violated the protocol
     Protocol,
@@ -863,9 +879,13 @@ pub enum ErrorKind {
     Timeout,
     /// Couldn't complete the handshake within the time limit set by the peer
     StaleCookie,
+    /// Remote peer aborted the association
+    Abort,
+    /// Remote peer upper level manually triggered an abort
+    UserInitiatedAbort { reason: Vec<u8> },
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Event {
     DataArrive { stream: u16 },
     SendFailure { reason: ErrorKind, context: u32 },

@@ -226,9 +226,42 @@ fn restart() {
     while let Some((assoc, event)) = server.poll() {
         use Event::*;
         match event {
-            Restart { .. } => { restarted = true; }
+            Restart { .. } => {
+                assert_eq!(assoc, server_assoc);
+                restarted = true;
+            }
             _ => {}
         }
     }
     assert!(restarted);
+}
+
+#[test]
+fn abort() {
+    let proto_params = Parameters::default();
+    let now = Instant::now();
+
+    let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 42);
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 24);
+
+    let mut client = Endpoint::new(proto_params, now, client_addr.port(), 1).unwrap();
+    let mut server = Endpoint::new(proto_params, now, server_addr.port(), 1).unwrap();
+
+    let (client_assoc, server_assoc) = run_handshake(now, &mut client, client_addr, &mut server, server_addr);
+    let reason = [1, 2, 3, 4];
+    client.abort(client_assoc, &reason);
+    transmit(now, &mut client, client_addr, &mut server, server_addr);
+    let mut aborted = false;
+    while let Some((assoc, event)) = server.poll() {
+        use Event::*;
+        match event {
+            CommunicationLost { reason: Some(ErrorKind::UserInitiatedAbort { reason: received }) } => {
+                assert_eq!(assoc, server_assoc);
+                assert_eq!(&received, &reason);
+                aborted = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(aborted);
 }
