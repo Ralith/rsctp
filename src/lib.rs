@@ -226,10 +226,12 @@ impl Endpoint {
 
     pub fn shutdown(&mut self, _assoc: usize) { unimplemented!() }
 
-    pub fn abort(&mut self, assoc: usize) {
+    pub fn abort(&mut self, assoc: usize, reason: &[u8]) {
+        // TODO: Assert MTU compliance
         let addr = self.associations[assoc].primary_path;
         let tag = self.associations[assoc].peer_verification_tag;
-        self.send_ootb(addr, tag, chunk::Abort {});
+        self.send_ootb(addr, tag, chunk::Abort {})
+            .param(chunk::UserInitiatedAbort(reason));
         self.remove_assoc(assoc, None);
     }
 

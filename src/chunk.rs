@@ -185,6 +185,23 @@ param!{
     address: Ipv6Addr,
 }
 
+pub struct UserInitiatedAbort<'a>(pub &'a [u8]);
+
+impl<'a> Wire<'a> for UserInitiatedAbort<'a> {
+    fn size() -> u16 { 4 }
+    fn decode(data: &'a [u8]) -> Self {
+        UserInitiatedAbort(data)
+    }
+    fn encode(&self, dest: &mut [u8]) {
+        dest.copy_from_slice(self.0);
+    }
+}
+
+impl<'a> Param<'a> for UserInitiatedAbort<'a> {
+    const TYPE: u16 = 8;
+    fn dynamic_size(&self) -> u16 { self.0.len() as u16 }
+}
+
 trait Field: Copy {
     fn decode(data: &[u8]) -> Self;
     fn encode(self, dest: &mut [u8]);
